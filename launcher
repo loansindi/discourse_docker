@@ -6,14 +6,14 @@ opt=$3
 
 cd "$(dirname "$0")"
 
-docker_min_version='0.9.1'
-docker_rec_version='0.11.1'
+docker_min_version='1.2.0'
+docker_rec_version='1.2.0'
 
 config_file=containers/"$config".yml
 cidfile=cids/"$config".cid
 cidbootstrap=cids/"$config"_boostrap.cid
 local_discourse=local_discourse
-image=samsaffron/discourse:0.2.5
+image=samsaffron/discourse:1.0.3
 docker_path=`which docker.io || which docker`
 
 docker_ip=`/sbin/ifconfig | \
@@ -152,6 +152,37 @@ install_docker() {
   exit 1
 }
 
+host_run() {
+  read -r -d '' env_ruby << 'RUBY'
+  require 'yaml'
+
+  input = STDIN.readlines.join
+  yaml = YAML.load(input)
+
+  if host_run = yaml['host_run']
+    params = yaml['params'] || {}
+    host_run.each do |run|
+      params.each do |k,v|
+        run = run.gsub("$#{k}", v)
+      end
+      STDOUT.write "#{run}--SEP--"
+    end
+  end
+RUBY
+
+  host_run=`cat $config_file | $docker_path run --rm -i -a stdout -a stdin $image ruby -e "$env_ruby"`
+
+  while [ "$host_run" ] ; do
+    iter=${host_run%%--SEP--*}
+    echo
+    echo "Host run: $iter"
+    $iter || exit 1
+    echo
+    host_run="${host_run#*--SEP--}"
+  done
+}
+
+
 set_volumes() {
   volumes=`cat $config_file | $docker_path run --rm -i -a stdout -a stdin $image ruby -e \
         "require 'yaml'; puts YAML.load(STDIN.readlines.join)['volumes'].map{|v| '-v ' << v['volume']['host'] << ':' << v['volume']['guest'] << ' '}.join"`
@@ -238,6 +269,17 @@ if [ ! -e $config_file ]
 fi
 
 
+docker_version=($($docker_path --version))
+docker_version=${test[2]//,/}
+
+if compare_version "1.2.0" "$docker_version"; then
+  echo "We recommend you upgrade docker, the version you are running has no restart policies, on reboot your container may not start up"
+  restart_policy=""
+else
+  restart_policy="--restart=always"
+fi
+
+
 run_mailtest(){
   if [ ! -e $config_file ]; then
     echo "Config does not exist: $config_file" >&2
@@ -258,6 +300,8 @@ run_stop(){
 
 run_start(){
 
+  host_run
+
   if [ ! -e $cidfile ]
      then
        echo "No cid found, creating a new container"
@@ -275,7 +319,7 @@ run_start(){
          exit 1
        fi
 
-       $docker_path run "${env[@]}" -h "`hostname`-$config" -e DOCKER_HOST_IP=$docker_ip --name $config -t --cidfile $cidfile $ports \
+       $docker_path run $restart_policy "${env[@]}" -h "`hostname`-$config" -e DOCKER_HOST_IP=$docker_ip --name $config -t --cidfile $cidfile $ports \
                   -d $volumes $local_discourse/$config /sbin/runit
 
        exit 0
@@ -305,6 +349,9 @@ run_start(){
 }
 
 run_bootstrap(){
+
+  host_run
+
   get_ssh_pub_key
 
   # Is the image available?
@@ -432,8 +479,10 @@ case "$command" in
       ;;
 
   rebuild)
-      echo "Updating discourse docker"
-      git pull || (echo 'failed to update' && exit 1)
+      if [ "$(git symbolic-ref --short HEAD)" == "master" ]; then
+        echo "Updating discourse docker"
+        git pull || (echo 'failed to update' && exit 1)
+      fi
       if [ -e $cidfile ]
         then
           echo "Stopping old container"
